@@ -19,7 +19,7 @@ from __future__ import print_function
 import inspect
 import sys
 import six
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta
 import tensorflow as tf
 
 import njunmt
@@ -41,14 +41,15 @@ for bri in BRIDGE_CLSS:
 
 
 @six.add_metaclass(ABCMeta)
-class BaseSeq2Seq(Configurable):
+class SequenceToSequence(Configurable):
     """ Base Sequence-to-Sequence Class """
+
     def __init__(self,
                  params,
                  mode,
                  vocab_source,
                  vocab_target,
-                 name="base_seq2seq",
+                 name="sequence_to_sequence",
                  verbose=True):
         """ Initializes model parameters.
 
@@ -61,7 +62,7 @@ class BaseSeq2Seq(Configurable):
             name: The name of this decoder.
             verbose: Print model parameters if set True.
         """
-        super(BaseSeq2Seq, self).__init__(
+        super(SequenceToSequence, self).__init__(
             params=params, mode=mode, verbose=False,
             name=name)
         self._vocab_source = vocab_source
@@ -109,20 +110,26 @@ class BaseSeq2Seq(Configurable):
             "modality.target.params": {},  # Arbitrary parameters for the modality
             "modality.params": {},  # Arbitrary parameters for the modality
             "source.reverse": False,
-            # "target.reverse": False,  # deprecated
             "inference.beam_size": 10,
-            "inference.maximum_labels_length": 200,
-            "inference.length_penalty": 0.0}
+            "inference.maximum_labels_length": 150,
+            "inference.length_penalty": -1.0,
+            "initializer": "random_uniform"}
 
-    @abstractmethod
-    def initializer(self):
+    def get_variable_initializer(self):
         """ Returns the default initializer of the model scope.
 
-        Returns: A `tf.random_uniform_initializer`.
+        Returns: A tf initializer.
         """
         dmodel = self.params["embedding.dim.target"]
-        return tf.random_uniform_initializer(
-            -dmodel ** -0.5, dmodel ** -0.5)
+        if self.params["initializer"] == "random_uniform":
+            return tf.random_uniform_initializer(
+                -dmodel ** -0.5, dmodel ** -0.5)
+        elif self.params["initializer"] == "normal_unit_scaling":
+            return tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode="FAN_AVG", uniform=False)
+        elif self.params["initializer"] == "uniform_unit_scaling":
+            return tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode="FAN_AVG", uniform=True)
+        else:
+            raise ValueError("Unrecognized initializer: {}".format(self.params["initializer"]))
 
     def build(self, input_fields):
         """ Builds the sequence-to-sequence model.
@@ -135,7 +142,7 @@ class BaseSeq2Seq(Configurable):
 
         Returns: Model output. See _pack_output() for more details.
         """
-        with tf.variable_scope(self._name, initializer=self.initializer()):
+        with tf.variable_scope(self._name, initializer=self.get_variable_initializer()):
             input_modality, target_modality = self._create_modalities()
             encoder = self._create_encoder()
             encoder_output = self._encode(
@@ -303,11 +310,34 @@ class BaseSeq2Seq(Configurable):
                 label_ids=kwargs[GlobalNames.PH_LABEL_IDS_NAME],
                 label_length=kwargs[GlobalNames.PH_LABEL_LENGTH_NAME],
                 target_modality=target_modality)
-            return [loss]
-        else:  # INFER
-            predict_out = dict()
-            predict_out["predicted_ids"] = infer_status.predicted_ids
-            predict_out["sequence_lengths"] = infer_status.lengths
-            predict_out["beam_ids"] = infer_status.beam_ids
-            predict_out["log_probs"] = infer_status.log_probs
-            return predict_out
+        if self.mode == ModeKeys.TRAIN:
+            return loss
+
+        attentions = dict()
+
+        def get_attention(name, atts):
+            if isinstance(atts, list):
+                for idx, a in enumerate(atts): # for multi-layer
+                    attentions[name + str(idx)] = a
+            else:
+                attentions[name] = atts
+
+        if hasattr(encoder_output, "encoder_self_attention"):
+            # now it can be only MultiHeadAttention with shape [batch_size, num_heads, length_q, length_k]
+            get_attention("encoder_self_attention", getattr(encoder_output, "encoder_self_attention"))
+        if hasattr(decoder_output, "encoder_decoder_attention"):
+            get_attention("encoder_decoder_attention", getattr(decoder_output, "encoder_decoder_attention"))
+        if hasattr(decoder_output, "decoder_self_attention"):
+            get_attention("decoder_self_attention", getattr(decoder_output, "decoder_self_attention"))
+
+        if self.mode == ModeKeys.EVAL:
+            return loss, attentions
+
+        assert self.mode == ModeKeys.INFER
+        predict_out = dict()
+        predict_out["predicted_ids"] = infer_status.predicted_ids
+        predict_out["sequence_lengths"] = infer_status.lengths
+        predict_out["beam_ids"] = infer_status.beam_ids
+        predict_out["log_probs"] = infer_status.log_probs
+        predict_out["attentions"] = attentions
+        return predict_out

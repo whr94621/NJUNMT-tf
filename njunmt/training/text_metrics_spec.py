@@ -23,7 +23,6 @@ from abc import ABCMeta, abstractmethod
 
 import numpy
 import six
-
 import tensorflow as tf
 from tensorflow import gfile
 from tensorflow.python.training import saver as saver_lib
@@ -32,12 +31,12 @@ from njunmt.data.text_inputter import ParallelTextInputter
 from njunmt.data.text_inputter import TextLineInputter
 from njunmt.inference.decode import evaluate
 from njunmt.inference.decode import infer
-from njunmt.utils.model_builder import model_fn
+from njunmt.models.model_builder import model_fn
 from njunmt.utils.configurable import update_infer_params
-from njunmt.utils.global_names import ModeKeys
-from njunmt.utils.global_names import GlobalNames
-from njunmt.utils.metrics import multi_bleu_score
 from njunmt.utils.expert_utils import StepTimer
+from njunmt.utils.global_names import GlobalNames
+from njunmt.utils.global_names import ModeKeys
+from njunmt.utils.metrics import multi_bleu_score
 from njunmt.utils.misc import get_dict_from_collection
 from njunmt.utils.summary_writer import SummaryWriter
 
@@ -192,8 +191,6 @@ class LossMetricSpec(TextMetricSpec):
             labels_field_name="eval_labels_file",
             batch_size=self._batch_size,
             batch_tokens_size=None,
-            maximum_features_length=None,
-            maximum_labels_length=None,
             shuffle_every_epoch=None,
             bucketing=True)
         self._eval_feeding_data = text_inputter.make_feeding_data()
@@ -222,10 +219,9 @@ class LossMetricSpec(TextMetricSpec):
             run_context: A `SessionRunContext` object.
             global_step: A python integer, the current training step.
         """
-        loss = evaluate(
-            sess=run_context.session,
-            eval_op=self._loss_op,
-            feeding_data=self._eval_feeding_data)
+        loss = evaluate(sess=run_context.session,
+                        eval_op=self._loss_op,
+                        feeding_data=self._eval_feeding_data)
         tf.logging.info("Evaluating DEVSET: DevLoss=%f  GlobalStep=%d" % (loss, global_step))
         if self._summary_writer is not None:
             self._summary_writer.add_summary("Metrics/DevLoss", loss, global_step)
@@ -359,8 +355,7 @@ class BleuMetricSpec(TextMetricSpec):
         text_inputter = TextLineInputter(
             dataset=self._dataset,
             data_field_name="eval_features_file",
-            batch_size=self._batch_size,
-            maximum_line_length=None)
+            batch_size=self._batch_size)
         self._eval_feeding_data = text_inputter.make_feeding_data()
         self._model_configs = update_infer_params(  # update inference parameters
             self._model_configs,

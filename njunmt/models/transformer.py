@@ -17,14 +17,16 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+import copy
 
 from njunmt.utils.global_names import ModeKeys
 from njunmt.utils.global_names import GlobalNames
-from njunmt.models.base_seq2seq import BaseSeq2Seq
+from njunmt.models.sequence_to_sequence import SequenceToSequence
 
 
-class Transformer(BaseSeq2Seq):
-    """ Define transformer model as described in https://arxiv.org/abs/1706.03762."""
+class Transformer(SequenceToSequence):
+    """ Define transformer model as described in https://arxiv.org/abs/1706.03762.
+    It is now reserved for old versions."""
 
     def __init__(self,
                  params,
@@ -48,26 +50,24 @@ class Transformer(BaseSeq2Seq):
                                           vocab_source=vocab_source,
                                           vocab_target=vocab_target,
                                           name=name, verbose=verbose)
+        assert self.params["encoder.class"].endswith("TransformerEncoder"), (
+            "Transformer must use TransformerEncoder.")
+        assert self.params["decoder.class"].endswith("TransformerDecocder"), (
+            "Transformer must use TransformerDecoder.")
 
     @staticmethod
     def default_params():
         """ Returns a dictionary of default parameters of this model. """
-        return {
-            "encoder.class": "njunmt.encoders.transformer_encoder.TransformerEncoder",
-            "encoder.params": {},  # Arbitrary parameters for the encoder
-            "decoder.class": "njunmt.decoders.transformer_decoder.TransformerDecocder",
-            "decoder.params": {},  # Arbitrary parameters for the decoder
-            "source.reverse": False,
-            # "target.reverse": False,
-            "embedding.dim.source": 512,
-            "embedding.dim.target": 512,
-            "modality.source.params": {},  # Arbitrary parameters for the modality
-            "modality.target.params": {},  # Arbitrary parameters for the modality
-            "modality.params": {},  # Arbitrary parameters for the modality
-            "inference.beam_size": 10,
-            "inference.maximum_labels_length": 200,
-            "inference.length_penalty": 0.0
-        }
+        t2t_default_params = copy.deepcopy(SequenceToSequence.default_params())
+        t2t_default_params["initializer"] = "uniform_unit_scaling"
+        t2t_default_params["inference.beam_size"] = 4
+        t2t_default_params["encoder.class"] = "njunmt.encoders.transformer_encoder.TransformerEncoder"
+        t2t_default_params["decoder.class"] = "njunmt.decoders.transformer_decoder.TransformerDecocder"
+        if "bridge.class" in t2t_default_params:
+            t2t_default_params.pop("bridge.class")
+        if "bridge.params" in t2t_default_params:
+            t2t_default_params.pop("bridge.params")
+        return t2t_default_params
 
     def _compute_loss_t2t(self, logits, label_ids, label_length, target_modality):
         """ Computes loss via `target_modality`. The loss is further
@@ -122,10 +122,3 @@ class Transformer(BaseSeq2Seq):
         Returns: None.
         """
         return None
-
-    def initializer(self):
-        """ Returns the default initializer of the model scope.
-
-        Returns: A `variance_scaling_initializer` (for deep models).
-        """
-        return tf.contrib.layers.variance_scaling_initializer(factor=1.0, mode="FAN_AVG", uniform=True)

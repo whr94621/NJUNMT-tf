@@ -20,9 +20,11 @@ import tensorflow as tf
 from collections import namedtuple
 
 import njunmt
-from njunmt.models.ensemble_model import EnsembleModel
+from njunmt.models import SequenceToSequence
+from njunmt.models import EnsembleModel
 from njunmt.utils.configurable import ModelConfigs
 from njunmt.utils.global_names import GlobalNames
+from njunmt.utils.global_names import ModeKeys
 from njunmt.training.optimize import optimize
 from njunmt.training.hooks import build_hooks
 
@@ -68,13 +70,13 @@ class EstimatorSpec(
             ValueError: If validation fails.
             TypeError: If any of the arguments is not the expected type.
         """
-        if predictions is None and mode == tf.contrib.learn.ModeKeys.INFER:
+        if predictions is None and mode == ModeKeys.INFER:
             raise ValueError("Missing predictions")
         if loss is None:
-            if mode in (tf.contrib.learn.ModeKeys.TRAIN,
-                        tf.contrib.learn.ModeKeys.EVAL):
+            if mode in (ModeKeys.TRAIN,
+                        ModeKeys.EVAL):
                 raise ValueError("Missing loss.")
-        if train_op is None and mode == tf.contrib.learn.ModeKeys.TRAIN:
+        if train_op is None and mode == ModeKeys.TRAIN:
             raise ValueError("Missing train_op.")
 
         training_chief_hooks = tuple(training_chief_hooks or [])
@@ -130,11 +132,14 @@ def model_fn(
     Returns: A `EstimatorSpec` object.
     """
     # Create model template function
-    model_name = name or model_configs["model"].split(".")[-1]
+    model_str = model_configs["model"]
+    if model_str is None:
+        model_str = "SequenceToSequence"
+    model_name = name or model_str.split(".")[-1]
     if verbose:
         tf.logging.info("Create model: {} for {}".format(
-            model_configs["model"], mode))
-    model = eval(model_configs["model"])(
+            model_str, mode))
+    model = eval(model_str)(
         params=model_configs["model_params"],
         mode=mode,
         vocab_source=dataset.vocab_source,
@@ -146,8 +151,8 @@ def model_fn(
     with tf.variable_scope("", reuse=reuse):
         model_output = model.build(dataset.input_fields)
     # training mode
-    if mode == tf.contrib.learn.ModeKeys.TRAIN:
-        loss = model_output[0]
+    if mode == ModeKeys.TRAIN:
+        loss = model_output
         # Register the training loss in a collection so that hooks can easily fetch them
         tf.add_to_collection(GlobalNames.DISPLAY_KEY_COLLECTION_NAME, GlobalNames.TRAIN_LOSS_KEY_NAME)
         tf.add_to_collection(GlobalNames.DISPLAY_VALUE_COLLECTION_NAME, loss)
@@ -166,17 +171,18 @@ def model_fn(
             training_chief_hooks=None)
 
     # evaluation mode
-    if mode == tf.contrib.learn.ModeKeys.EVAL:
+    if mode == ModeKeys.EVAL:
         loss = model_output[0]
         return EstimatorSpec(
             mode,
-            loss=loss)
+            loss=loss,
+            # attentions for force decoding
+            predictions=model_output[1])
 
-    assert mode == tf.contrib.learn.ModeKeys.INFER
-    predictions = model_output
+    assert mode == ModeKeys.INFER
     return EstimatorSpec(
         mode,
-        predictions=predictions)
+        predictions=model_output)
 
 
 def model_fn_ensemble(
@@ -226,7 +232,7 @@ def model_fn_ensemble(
                 model_configs["model"]))
         model = eval(model_configs["model"])(
             params=model_configs["model_params"],
-            mode=tf.contrib.learn.ModeKeys.INFER,
+            mode=ModeKeys.INFER,
             vocab_source=dataset.vocab_source,
             vocab_target=dataset.vocab_target,
             name=model_name,
@@ -240,5 +246,5 @@ def model_fn_ensemble(
             input_fields=dataset.input_fields, base_models=models,
             vocab_target=dataset.vocab_target)
     return EstimatorSpec(
-        tf.contrib.learn.ModeKeys.INFER,
+        ModeKeys.INFER,
         predictions=predictions)

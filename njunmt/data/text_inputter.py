@@ -54,7 +54,7 @@ class TextInputter(object):
         return self._dataset._input_fields
 
     @abstractmethod
-    def make_feeding_data(self):
+    def make_feeding_data(self, *args, **kwargs):
         """ Processes the data file and return an iterable instance for loop. """
         raise NotImplementedError
 
@@ -65,8 +65,7 @@ class TextLineInputter(TextInputter):
     def __init__(self,
                  dataset,
                  data_field_name,
-                 batch_size,
-                 maximum_line_length=None):
+                 batch_size):
         """ Initializes the parameters for this inputter.
 
         Args:
@@ -75,8 +74,6 @@ class TextLineInputter(TextInputter):
               access to a data file.
             batch_size: An integer value indicating the number of
               sentences passed into one step. Sentences will be padded by EOS.
-            maximum_line_length: The maximum sequence length. If provided,
-              sentences exceeding this value will be ignore.
 
         Raises:
             ValueError: if `batch_size` is None, or if `dataset` has no
@@ -93,17 +90,24 @@ class TextLineInputter(TextInputter):
         if not (isinstance(self._data_files, str) or isinstance(self._data_files, list)):
             raise ValueError("error type with for attribute \"{}\" of dataset, "
                              "which should be str or list".format(data_field_name))
-        self._maximum_line_length = maximum_line_length
         if "features" in data_field_name:
             self._vocab = dataset.vocab_source
         else:
             self._vocab = dataset.vocab_target
 
-    def _make_feeding_data_from(self, filename):
+    def _make_feeding_data_from(self,
+                                filename,
+                                maximum_line_length=None,
+                                maximum_encoded_length=None):
         """ Processes the data file and return an iterable instance for loop.
 
         Args:
             filename: A specific data file.
+            maximum_line_length: The maximum sequence length. If provided,
+              sentences exceeding this value will be ignore.
+            maximum_encoded_length: The maximum length of symbols (especially
+              after BPE is applied). If provided symbols of one sentence exceeding
+              this value will be ignore.
 
         Returns: An iterable instance that packs feeding dictionary
                    for `tf.Session().run` according to the `filename`.
@@ -112,8 +116,14 @@ class TextLineInputter(TextInputter):
         str_buf = []
         ss_buf = []
         for ss in features:
-            str_buf.append(self._vocab.bpe_encode(ss.strip()))
-            ss_buf.append(self._vocab.convert_to_idlist(ss.strip().split(" ")))
+            if maximum_line_length and len(ss.strip().split()) > maximum_line_length:
+                continue
+            encoded_ss = self._vocab.convert_to_idlist(ss.strip().split(" "))
+            if maximum_encoded_length and len(encoded_ss) - 1 > maximum_encoded_length:
+                continue
+            bpe_ss = self._vocab.bpe_encode(ss.strip())
+            str_buf.append(bpe_ss)
+            ss_buf.append(encoded_ss)
         close_file(features)
         data = []
         batch_data_idx = 0
@@ -129,9 +139,16 @@ class TextLineInputter(TextInputter):
                  self.input_fields[GlobalNames.PH_FEATURE_LENGTH_NAME]: len_x}))
         return data
 
-    def make_feeding_data(self):
+    def make_feeding_data(self, maximum_line_length=None, maximum_encoded_length=None):
         """ Processes the data file(s) and return an iterable
         instance for loop.
+
+        Args:
+            maximum_line_length: The maximum sequence length. If provided,
+              sentences exceeding this value will be ignore.
+            maximum_encoded_length: The maximum length of symbols (especially
+              after BPE is applied). If provided symbols of one sentence exceeding
+              this value will be ignore.
 
         Returns: An iterable instance or a list of iterable
                    instances according to the `data_field_name`
@@ -151,8 +168,6 @@ class ParallelTextInputter(TextInputter):
                  labels_field_name,
                  batch_size=None,
                  batch_tokens_size=None,
-                 maximum_features_length=None,
-                 maximum_labels_length=None,
                  shuffle_every_epoch=None,
                  bucketing=True):
         """ Initializes the parameters for this inputter.
@@ -168,12 +183,6 @@ class ParallelTextInputter(TextInputter):
             batch_tokens_size: An integer value indicating the number of
               words of each batch. If provided, sentence pairs will be batched
               together by approximate sequence length.
-            maximum_features_length: The maximum sequence length of features.
-              If provided, sentences of "features" field exceeding this value
-              will be ignore.
-            maximum_labels_length: The maximum sequence length of labels.
-              If provided, sentences of "labels" field exceeding this value
-              will be ignore.
             shuffle_every_epoch: A string type. If provided, use it as postfix
               of shuffled data file name.
             bucketing: Whether to sort the sentences by length of labels.
@@ -187,8 +196,6 @@ class ParallelTextInputter(TextInputter):
         super(ParallelTextInputter, self).__init__(
             dataset, batch_size)
         self._batch_tokens_size = batch_tokens_size
-        self._maximum_features_length = maximum_features_length
-        self._maximum_labels_length = maximum_labels_length
         self._shuffle_every_epoch = shuffle_every_epoch
         if not hasattr(dataset, features_field_name):
             raise ValueError("dataset object has no attribute named \"{}\""
@@ -211,40 +218,200 @@ class ParallelTextInputter(TextInputter):
             if batch_size is None:
                 self._batch_size = 32
 
-    def make_feeding_data(self):
+    def make_feeding_data(self,
+                          maximum_features_length=None,
+                          maximum_labels_length=None,
+                          maximum_encoded_features_length=None,
+                          maximum_encoded_labels_length=None):
         """ Processes the data files and return an iterable
               instance for loop.
 
-        Returns: An iterable instance.
+        Args:
+            maximum_features_length: The maximum sequence length of "features" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_labels_length: The maximum sequence length of "labels" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_encoded_features_length: The maximum length of feature symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+            maximum_encoded_labels_length: The maximum length of label symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+
+        Returns: An iterable instance or a list of iterable instances.
         """
         if self._features_file is None or self._labels_file is None:
             raise ValueError("Both _features_file and _labels_file should be provided.")
-        if not hasattr(self, "_parallel_data"):
-            line_count = 0
-            with gfile.GFile(self._features_file) as fp:
-                for _ in fp:
-                    line_count += 1
-            if line_count > self._cache_size or self._batch_tokens_size is not None:
-                setattr(self, "_parallel_data", self._BigParallelData(self))
-            else:
-                setattr(self, "_parallel_data", self._SmallParallelData())
-        return self._parallel_data
+        if isinstance(self._features_file, list):
+            return [self._make_feeding_data(f, l, maximum_features_length, maximum_labels_length,
+                                            maximum_encoded_features_length, maximum_encoded_labels_length)
+                    for f, l in zip(self._features_file, self._labels_file)]
+        return self._make_feeding_data(
+            self._features_file, self._labels_file,
+            maximum_features_length, maximum_labels_length,
+            maximum_encoded_features_length, maximum_encoded_labels_length)
 
-    def _SmallParallelData(self):
-        """ Function for reading small scale parallel data.
+    def _make_feeding_data(self,
+                           features_file,
+                           labels_file,
+                           maximum_features_length=None,
+                           maximum_labels_length=None,
+                           maximum_encoded_features_length=None,
+                           maximum_encoded_labels_length=None):
+        """ Processes the data files and return an iterable
+              instance for loop.
+
+        Args:
+            features_file: The path of features file.
+            labels_file: The path of labels file.
+            maximum_features_length: The maximum sequence length of "features" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_labels_length: The maximum sequence length of "labels" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_encoded_features_length: The maximum length of feature symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+            maximum_encoded_labels_length: The maximum length of label symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+
+        Returns: An iterable instance.
+        """
+        if features_file is None or labels_file is None:
+            raise ValueError("Both features_file and labels_file should be provided.")
+        line_count = 0
+        with gfile.GFile(features_file) as fp:
+            for _ in fp:
+                line_count += 1
+        if line_count > self._cache_size or self._batch_tokens_size is not None:
+            return self._BigParallelData(
+                self, features_file, labels_file,
+                maximum_features_length, maximum_labels_length,
+                maximum_encoded_features_length, maximum_encoded_labels_length)
+        return self._SmallParallelData(
+            features_file, labels_file,
+            maximum_features_length, maximum_labels_length,
+            maximum_encoded_features_length, maximum_encoded_labels_length)
+
+    def make_eval_feeding_data(self):
+        """ Processes the data files and return an iterable instance for loop,
+        especially for output_attention when EVAL.
+
+        Returns: An iterable instance or a list of iterable instances.
+
+        """
+        if self._features_file is None or self._labels_file is None:
+            raise ValueError("Both _features_file and _labels_file should be provided.")
+        if isinstance(self._features_file, list):
+            return [self._EvalParallelData(f, l)
+                    for f, l in zip(self._features_file, self._labels_file)]
+        return self._EvalParallelData(
+            self._features_file, self._labels_file)
+
+    def _EvalParallelData(self,
+                          features_file,
+                          labels_file):
+        """ Function for reading small scale parallel data for evaluation.
+
+        Args:
+            features_file: The path of features file.
+            labels_file: The path of labels file.
 
         Returns: A list of feeding data.
         """
-        eval_features = open_file(self._features_file, encoding="utf-8")
-        if gfile.Exists(self._labels_file):
-            eval_labels = open_file(self._labels_file, encoding="utf-8")
+        eval_features = open_file(features_file, encoding="utf-8")
+        if gfile.Exists(labels_file):
+            eval_labels = open_file(labels_file, encoding="utf-8")
         else:
-            eval_labels = open_file(self._labels_file + "0", encoding="utf-8")
+            eval_labels = open_file(labels_file + "0", encoding="utf-8")
+        ss_buf = []
+        tt_buf = []
+        ss_str_buf = []
+        tt_str_buf = []
+        for ss, tt in zip(eval_features, eval_labels):
+            ss_str = self._vocab_source.bpe_encode(ss.strip()).split(" ")
+            tt_str = self._vocab_target.bpe_encode(tt.strip()).split(" ")
+            ss_str_buf.append(ss_str)
+            tt_str_buf.append(tt_str)
+            ss_buf.append(self._vocab_source.convert_to_idlist(ss.strip()))
+            tt_buf.append(self._vocab_target.convert_to_idlist(tt.strip()))
+        close_file(eval_features)
+        close_file(eval_labels)
+        if self._bucketing:
+            tlen = numpy.array([len(t) for t in tt_buf])
+            tidx = tlen.argsort()
+            _ss_buf = [ss_buf[i] for i in tidx]
+            _tt_buf = [tt_buf[i] for i in tidx]
+            _ss_str_buf = [ss_str_buf[i] for i in tidx]
+            _tt_str_buf = [tt_str_buf[i] for i in tidx]
+            ss_buf = _ss_buf
+            tt_buf = _tt_buf
+            ss_str_buf = _ss_str_buf
+            tt_str_buf = _tt_str_buf
+        data = []
+        batch_data_idx = 0
+        while batch_data_idx < len(ss_buf):
+            x, len_x = padding_batch_data(
+                ss_buf[batch_data_idx: batch_data_idx + self._batch_size],
+                self._vocab_source.eos_id)
+            y, len_y = padding_batch_data(
+                tt_buf[batch_data_idx: batch_data_idx + self._batch_size],
+                self._vocab_target.eos_id)
+            data.append((
+                ss_str_buf[batch_data_idx: batch_data_idx + self._batch_size],
+                tt_str_buf[batch_data_idx: batch_data_idx + self._batch_size], {
+                    self.input_fields[GlobalNames.PH_FEATURE_IDS_NAME]: x,
+                    self.input_fields[GlobalNames.PH_FEATURE_LENGTH_NAME]: len_x,
+                    self.input_fields[GlobalNames.PH_LABEL_IDS_NAME]: y,
+                    self.input_fields[GlobalNames.PH_LABEL_LENGTH_NAME]: len_y}))
+            batch_data_idx += self._batch_size
+        return data
+
+    def _SmallParallelData(self,
+                           features_file,
+                           labels_file,
+                           maximum_features_length=None,
+                           maximum_labels_length=None,
+                           maximum_encoded_features_length=None,
+                           maximum_encoded_labels_length=None):
+        """ Function for reading small scale parallel data.
+
+        Args:
+            features_file: The path of features file.
+            labels_file: The path of labels file.
+            maximum_features_length: The maximum sequence length of "features" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_labels_length: The maximum sequence length of "labels" field.
+              If provided, sentences exceeding this value will be ignore.
+            maximum_encoded_features_length: The maximum length of feature symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+            maximum_encoded_labels_length: The maximum length of label symbols (especially
+              after BPE is applied) . If provided, the number of symbols of one sentence
+              exceeding this value will be ignore.
+
+        Returns: A list of feeding data.
+        """
+        eval_features = open_file(features_file, encoding="utf-8")
+        if gfile.Exists(labels_file):
+            eval_labels = open_file(labels_file, encoding="utf-8")
+        else:
+            eval_labels = open_file(labels_file + "0", encoding="utf-8")
         ss_buf = []
         tt_buf = []
         for ss, tt in zip(eval_features, eval_labels):
-            ss_buf.append(self._vocab_source.convert_to_idlist(ss.strip().split(" ")))
-            tt_buf.append(self._vocab_target.convert_to_idlist(tt.strip().split(" ")))
+            if maximum_features_length and len(ss.strip().split()) > maximum_features_length:
+                continue
+            if maximum_labels_length and len(tt.strip().split()) > maximum_labels_length:
+                continue
+            encoded_ss = self._vocab_source.convert_to_idlist(ss.strip().split(" "))
+            if maximum_encoded_features_length and len(encoded_ss) - 1 > maximum_encoded_features_length:
+                continue
+            encoded_tt = self._vocab_target.convert_to_idlist(tt.strip().split(" "))
+            if maximum_encoded_labels_length and len(encoded_tt) - 1 > maximum_encoded_labels_length:
+                continue
+            ss_buf.append(encoded_ss)
+            tt_buf.append(encoded_tt)
         close_file(eval_features)
         close_file(eval_labels)
         if self._bucketing:
@@ -274,17 +441,40 @@ class ParallelTextInputter(TextInputter):
     class _BigParallelData(object):
         """ An iterator class for reading parallel data. """
 
-        def __init__(self, parent):
+        def __init__(self,
+                     parent,
+                     features_file,
+                     labels_file,
+                     maximum_features_length=None,
+                     maximum_labels_length=None,
+                     maximum_encoded_features_length=None,
+                     maximum_encoded_labels_length=None):
             """ Initializes.
 
             Args:
                 parent: A `ParallelTextInputter` object.
+                features_file: The path of features file.
+                labels_file: The path of labels file.
+                maximum_features_length: The maximum sequence length of "features" field.
+                  If provided, sentences exceeding this value will be ignore.
+                maximum_labels_length: The maximum sequence length of "labels" field.
+                  If provided, sentences exceeding this value will be ignore.
+                maximum_encoded_features_length: The maximum length of feature symbols (especially
+                  after BPE is applied) . If provided, the number of symbols of one sentence
+                  exceeding this value will be ignore.
+                maximum_encoded_labels_length: The maximum length of label symbols (especially
+                  after BPE is applied) . If provided, the number of symbols of one sentence
+                  exceeding this value will be ignore.
             """
             self._parent = parent
-            self._features_file = self._parent._features_file
-            self._labels_file = self._parent._labels_file
+            self._features_file = features_file
+            self._labels_file = labels_file
             if not gfile.Exists(self._labels_file):
                 self._labels_file = self._labels_file + "0"
+            self._maximum_features_length = maximum_features_length
+            self._maximum_labels_length = maximum_labels_length
+            self._maximum_encoded_features_length = maximum_encoded_features_length
+            self._maximum_encoded_labels_length = maximum_encoded_labels_length
             if self._parent._shuffle_every_epoch:
                 self._shuffle_features_file = self._features_file.strip().split("/")[-1] \
                                               + "." + self._parent._shuffle_every_epoch
@@ -318,39 +508,51 @@ class ParallelTextInputter(TextInputter):
             """
             return self.next()
 
+        def _next_features(self):
+            ss_tmp = self._features.readline()
+            if ss_tmp == "":
+                return ""
+            ss_tmp = ss_tmp.strip().split(" ")
+            if self._maximum_features_length and len(ss_tmp) > self._maximum_features_length:
+                return None
+            encoded_ss = self._parent._vocab_source.convert_to_idlist(ss_tmp)
+            if self._maximum_encoded_features_length and len(
+                    encoded_ss) - 1 > self._maximum_encoded_features_length:
+                return None
+            return encoded_ss
+
+        def _next_labels(self):
+            tt_tmp = self._labels.readline()
+            if tt_tmp == "":
+                return ""
+            tt_tmp = tt_tmp.strip().split(" ")
+            if self._maximum_labels_length and len(tt_tmp) > self._maximum_labels_length:
+                return None
+            encoded_tt = self._parent._vocab_target.convert_to_idlist(tt_tmp)
+            if self._maximum_encoded_labels_length and len(
+                    encoded_tt) - 1 > self._maximum_encoded_labels_length:
+                return None
+            return encoded_tt
+
         def next(self):
             if self._end_of_data:
                 self._end_of_data = False
                 self._reset()
                 raise StopIteration
 
-            def next_line(fp, maxlen):
-                ss_tmp = fp.readline()
-                if ss_tmp == "":
-                    return ""
-                ss_tmp = ss_tmp.strip().split(" ")
-                if maxlen is not None and len(ss_tmp) > maxlen:
-                    return None
-                return ss_tmp
-
             assert len(self._features_buffer) == len(self._labels_buffer), "Buffer size mismatch"
             if len(self._features_buffer) < self._parent._batch_size:
                 cnt = len(self._features_buffer)
-                tmp_features_buf = []
-                tmp_labels_buf = []
                 while cnt < self._parent._cache_size:
-                    ss = next_line(self._features, self._parent._maximum_features_length)
-                    tt = next_line(self._labels, self._parent._maximum_labels_length)
+                    ss = self._next_features()
+                    tt = self._next_labels()
                     if ss == "" or tt == "":
                         break
                     if ss is None or tt is None:
                         continue
                     cnt += 1
-                    tmp_features_buf.append(ss)
-                    tmp_labels_buf.append(tt)
-                if len(tmp_features_buf) > 0:
-                    self._features_buffer.extend(map(self._parent._vocab_source, tmp_features_buf))
-                    self._labels_buffer.extend(map(self._parent._vocab_target, tmp_labels_buf))
+                    self._features_buffer.append(ss)
+                    self._labels_buffer.append(tt)
                 if len(self._features_buffer) == 0 or len(self._labels_buffer) == 0:
                     self._end_of_data = False
                     self._reset()

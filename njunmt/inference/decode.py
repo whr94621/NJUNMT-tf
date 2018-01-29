@@ -17,7 +17,6 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy
-import json
 import os
 import random
 import string
@@ -25,6 +24,9 @@ import re
 import tensorflow as tf
 from tensorflow import gfile
 
+from njunmt.inference.attention import process_attention_output
+from njunmt.inference.attention import pack_batch_attention_dict
+from njunmt.inference.attention import dump_attentions
 from njunmt.utils.global_names import GlobalNames
 from njunmt.utils.misc import padding_batch_data
 
@@ -88,13 +90,11 @@ def evaluate_sentences(
     return _evaluate(sess, feed_dict, eval_op)
 
 
-def evaluate(
-        sess,
-        eval_op,
-        feeding_data):
+def evaluate(sess, eval_op, feeding_data):
     """ Evaluates data by loss.
 
     Args:
+        attention_op:
         sess: `tf.Session`.
         eval_op: Tensorflow operation, computing the loss.
         feeding_data: An iterable instance that each element
@@ -112,13 +112,57 @@ def evaluate(
     return loss
 
 
+def evaluate_with_attention(
+        sess,
+        eval_op,
+        feeding_data,
+        vocab_source=None,
+        vocab_target=None,
+        attention_op=None,
+        output_filename_prefix=None):
+    """ Evaluates data by loss.
+
+    Args:
+        sess: `tf.Session`.
+        eval_op: Tensorflow operation, computing the loss.
+        feeding_data: An iterable instance that each element
+          is a packed feeding dictionary for `sess`.
+        vocab_source: A `Vocab` instance for source side feature map. For highlighting UNK.
+        vocab_target: A `Vocab` instance for target side feature map. For highlighting UNK.
+        attention_op: Tensorflow operation for output attention.
+        output_filename_prefix: A string.
+
+    Returns: Total loss averaged by number of data samples.
+    """
+    losses = 0.
+    total_size = 0
+    attentions = {}
+    for ss_strs, tt_strs, feed_dict in feeding_data:
+        if attention_op is None:
+            loss = _evaluate(sess, feed_dict, eval_op)
+        else:
+            loss, atts = _evaluate(sess, feed_dict, [eval_op, attention_op])
+            if vocab_source is not None:
+                ss_strs = [vocab_source.decorate_with_unk(ss) for ss in ss_strs]
+                tt_strs = [vocab_target.decorate_with_unk(tt) for tt in tt_strs]
+            attentions.update(pack_batch_attention_dict(
+                total_size, ss_strs, tt_strs, atts))
+        losses += loss * float(len(ss_strs))
+        total_size += len(ss_strs)
+    loss = losses / float(total_size)
+    if attention_op is not None:
+        dump_attentions(output_filename_prefix, attentions)
+    return loss
+
+
 def _infer(
         sess,
         feed_dict,
         prediction_op,
         batch_size,
         alpha=None,
-        top_k=1):
+        top_k=1,
+        output_attention=False):
     """ Infers a batch of samples with beam search.
 
     Args:
@@ -131,6 +175,7 @@ def _infer(
           sequence.
         top_k: An integer, number of predicted sequences will be
           returned.
+        output_attention: Whether to output attention.
 
     Returns: A tuple `(predicted_sequences, attention_scores)`.
       The `predicted_sequences` is an ndarray of shape
@@ -138,8 +183,18 @@ def _infer(
       The `attention_scores` is None if there is no attention
       related information in `prediction_op`.
     """
-    predict_out = sess.run(prediction_op,
-                           feed_dict=feed_dict)
+    if output_attention:
+        predict_out = sess.run(prediction_op,
+                               feed_dict=feed_dict)
+    else:
+        has_att = False
+        if "attentions" in prediction_op:
+            att_op = prediction_op.pop("attentions")
+            has_att = True
+        predict_out = sess.run(prediction_op,
+                               feed_dict=feed_dict)
+        if has_att:
+            prediction_op["attentions"] = att_op
     predicted_ids = predict_out["predicted_ids"]  # [n_timesteps_trg, batch_size * beam_size]
     beam_ids = predict_out["beam_ids"]  # [n_timesteps_trg, batch_size * beam_size]
     sequence_lengths = predict_out["sequence_lengths"]  # [n_timesteps_trg, batch_size * beam_size]
@@ -164,15 +219,9 @@ def _infer(
     argidx = numpy.argsort(scores, axis=1)[:, ::-1]  # descending order: [batch_size, beam_size]
     argidx += numpy.tile(numpy.arange(batch_size) * beam_size, [beam_size, 1]).transpose()
     argidx = numpy.reshape(argidx[:, :top_k], -1)
-
-    if "attention_scores" in predict_out:
-        # [n_timesteps_trg, batch_size * beam_size, n_timesteps_src]
-        attention_scores = predict_out["attention_scores"]
-        gathered_att = numpy.zeros_like(attention_scores)
-        for idx in range(beam_ids.shape[0]):
-            gathered_att = gathered_att[:, beam_ids[idx], :]
-            gathered_att[idx, :, :] = attention_scores[idx]
-        return gathered_pred_ids[argidx, :], gathered_att[:, argidx, :]
+    if output_attention:
+        attentions = process_attention_output(predict_out, argidx)
+        return gathered_pred_ids[argidx, :], attentions
     return gathered_pred_ids[argidx, :], None
 
 
@@ -222,6 +271,7 @@ def infer(
         feeding_data,
         output,
         vocab_target,
+        vocab_source=None,
         alpha=None,
         delimiter=" ",
         output_attention=False,
@@ -237,6 +287,7 @@ def infer(
           is a packed feeding dictionary for `sess`.
         output: Output file name, `str`.
         vocab_target: A `Vocab` instance for target side feature map.
+        vocab_source: A `Vocab` instance for source side feature map. For highlighting UNK.
         alpha: A scalar number, length penalty rate. If not provided
           or < 0, simply average each beam by length of predicted
           sequence.
@@ -256,7 +307,9 @@ def infer(
     with gfile.GFile(output, "w") as fw:
         cnt = 0
         for x_str, x_len, feeding_batch in feeding_data:
-            prediction, att = _infer(sess, feeding_batch, prediction_op, len(x_str), alpha=alpha, top_k=1)
+            prediction, att = _infer(sess, feeding_batch, prediction_op,
+                                     len(x_str), alpha=alpha, top_k=1,
+                                     output_attention=output_attention)
             y_str = [delimiter.join(vocab_target.convert_to_wordlist(prediction[sample_idx]))
                      for sample_idx in range(prediction.shape[0])]
             fw.write('\n'.join(y_str) + "\n")
@@ -267,14 +320,19 @@ def infer(
                     samples_trg.append(y_str[sample_idx])
                     if len(samples_src) >= 5:
                         break
+
             # output attention
             if output_attention and att is not None:
-                for idx in range(len(x_str)):
-                    trans_list = vocab_target.convert_to_wordlist(prediction[idx, :], bpe_decoding=False)
-                    attentions[cnt + idx] = {
-                        "source": x_str[idx],
-                        "translation": " ".join(trans_list),
-                        "attention": att[:len(trans_list) + 1, idx, :x_len[idx]].tolist()}
+                source_tokens = [x.strip().split() for x in x_str]
+                if vocab_source is not None:
+                    source_tokens = [vocab_source.decorate_with_unk(x)
+                                     for x in source_tokens]
+                candidate_tokens = [vocab_target.convert_to_wordlist(
+                    prediction[idx, :], bpe_decoding=False, reverse_seq=False)
+                                    for idx in range(len(x_str))]
+
+                attentions.update(pack_batch_attention_dict(
+                    cnt, source_tokens, candidate_tokens, att))
             cnt += len(x_str)
             if verbose:
                 tf.logging.info(cnt)
@@ -285,6 +343,5 @@ def infer(
                   (tokenize_script, output, tmp_output_file))
         os.system("mv %s %s" % (tmp_output_file, output))
     if output_attention:
-        with gfile.GFile(output + ".attention", "wb") as f:
-            f.write(json.dumps(attentions).encode("utf-8"))
+        dump_attentions(output, attentions)
     return samples_src, samples_trg

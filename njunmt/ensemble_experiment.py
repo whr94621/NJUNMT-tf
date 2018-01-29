@@ -13,18 +13,19 @@
 # limitations under the License.
 """ Define an experiment for ensemble. """
 import time
+
 import tensorflow as tf
 
-from njunmt.nmt_experiment import Experiment
-from njunmt.nmt_experiment import InferExperiment
 from njunmt.data.dataset import Dataset
 from njunmt.data.text_inputter import TextLineInputter
 from njunmt.data.vocab import Vocab
+from njunmt.inference.decode import infer
+from njunmt.models.model_builder import model_fn_ensemble
+from njunmt.nmt_experiment import Experiment
+from njunmt.nmt_experiment import InferExperiment
 from njunmt.utils.configurable import parse_params
 from njunmt.utils.configurable import print_params
 from njunmt.utils.metrics import multi_bleu_score
-from njunmt.utils.model_builder import model_fn_ensemble
-from njunmt.inference.decode import infer
 
 
 class EnsembleExperiment(Experiment):
@@ -92,8 +93,7 @@ class EnsembleExperiment(Experiment):
         text_inputter = TextLineInputter(
             dataset=dataset,
             data_field_name="eval_features_file",
-            batch_size=self._model_configs["infer"]["batch_size"],
-            maximum_line_length=None)
+            batch_size=self._model_configs["infer"]["batch_size"])
         sess.run(tf.global_variables_initializer())
         tf.logging.info("Start inference.")
         overall_start_time = time.time()
