@@ -16,17 +16,19 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import six
+
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import dtypes
 
-from njunmt.utils.global_names import GlobalNames
+from njunmt.utils.constants import Constants
+from njunmt.utils.misc import get_labels_files
 
 
 class Dataset(object):
     """ Class for training data and evaluation data """
-    _input_fields = None
 
     def __init__(self,
                  vocab_source,
@@ -50,9 +52,13 @@ class Dataset(object):
         self._train_features_file = train_features_file
         self._train_labels_file = train_labels_file
         self._eval_features_file = eval_features_file
-        self._eval_labels_file = eval_labels_file
-        if Dataset._input_fields is None:
-            Dataset._input_fields = Dataset._make_input_fields()
+        if isinstance(eval_labels_file, list):
+            self._eval_labels_file = [get_labels_files(f) for f in eval_labels_file]
+        elif isinstance(eval_labels_file, six.string_types):
+            self._eval_labels_file = get_labels_files(eval_labels_file)
+        else:
+            self._eval_labels_file = None
+        self._input_fields = Dataset._make_input_fields()
 
     @staticmethod
     def _make_input_fields():
@@ -62,10 +68,10 @@ class Dataset(object):
         Returns: A dictionary of placeholders.
 
         """
-        feature_ids = array_ops.placeholder(dtypes.int32, shape=(None, None), name=GlobalNames.PH_FEATURE_IDS_NAME)
-        feature_length = array_ops.placeholder(dtypes.int32, shape=(None,), name=GlobalNames.PH_FEATURE_LENGTH_NAME)
-        label_ids = array_ops.placeholder(dtypes.int32, shape=(None, None), name=GlobalNames.PH_LABEL_IDS_NAME)
-        label_length = array_ops.placeholder(dtypes.int32, shape=(None,), name=GlobalNames.PH_LABEL_LENGTH_NAME)
+        feature_ids = array_ops.placeholder(dtypes.int32, shape=(None, None), name=Constants.FEATURE_IDS_NAME)
+        feature_length = array_ops.placeholder(dtypes.int32, shape=(None,), name=Constants.FEATURE_LENGTH_NAME)
+        label_ids = array_ops.placeholder(dtypes.int32, shape=(None, None), name=Constants.LABEL_IDS_NAME)
+        label_length = array_ops.placeholder(dtypes.int32, shape=(None,), name=Constants.LABEL_LENGTH_NAME)
 
         feature_nonpadding_tokens_num = math_ops.reduce_sum(feature_length)
         feature_shape = array_ops.shape(feature_ids)
@@ -73,29 +79,29 @@ class Dataset(object):
         label_nonpadding_tokens_num = math_ops.reduce_sum(label_length)
         label_shape = array_ops.shape(label_ids)
         label_total_tokens_num = label_shape[0] * label_shape[1]
-        ops.add_to_collection(GlobalNames.DISPLAY_KEY_COLLECTION_NAME, "input_stats/feature_nonpadding_tokens_num")
-        ops.add_to_collection(GlobalNames.DISPLAY_VALUE_COLLECTION_NAME, feature_nonpadding_tokens_num)
-        ops.add_to_collection(GlobalNames.DISPLAY_KEY_COLLECTION_NAME, "input_stats/feature_nonpadding_ratio")
-        ops.add_to_collection(GlobalNames.DISPLAY_VALUE_COLLECTION_NAME,
+        ops.add_to_collection(Constants.DISPLAY_KEY_COLLECTION_NAME, "input_stats/feature_nonpadding_tokens_num")
+        ops.add_to_collection(Constants.DISPLAY_VALUE_COLLECTION_NAME, feature_nonpadding_tokens_num)
+        ops.add_to_collection(Constants.DISPLAY_KEY_COLLECTION_NAME, "input_stats/feature_nonpadding_ratio")
+        ops.add_to_collection(Constants.DISPLAY_VALUE_COLLECTION_NAME,
                               math_ops.to_float(feature_nonpadding_tokens_num)
                               / math_ops.to_float(feature_total_tokens_num))
-        ops.add_to_collection(GlobalNames.DISPLAY_KEY_COLLECTION_NAME, "input_stats/label_nonpadding_tokens_num")
-        ops.add_to_collection(GlobalNames.DISPLAY_VALUE_COLLECTION_NAME, label_nonpadding_tokens_num)
-        ops.add_to_collection(GlobalNames.DISPLAY_KEY_COLLECTION_NAME, "input_stats/label_nonpadding_ratio")
-        ops.add_to_collection(GlobalNames.DISPLAY_VALUE_COLLECTION_NAME,
+        ops.add_to_collection(Constants.DISPLAY_KEY_COLLECTION_NAME, "input_stats/label_nonpadding_tokens_num")
+        ops.add_to_collection(Constants.DISPLAY_VALUE_COLLECTION_NAME, label_nonpadding_tokens_num)
+        ops.add_to_collection(Constants.DISPLAY_KEY_COLLECTION_NAME, "input_stats/label_nonpadding_ratio")
+        ops.add_to_collection(Constants.DISPLAY_VALUE_COLLECTION_NAME,
                               math_ops.to_float(label_nonpadding_tokens_num)
                               / math_ops.to_float(label_total_tokens_num))
-        return {GlobalNames.PH_FEATURE_IDS_NAME: feature_ids,
-                GlobalNames.PH_FEATURE_LENGTH_NAME: feature_length,
-                GlobalNames.PH_LABEL_IDS_NAME: label_ids,
-                GlobalNames.PH_LABEL_LENGTH_NAME: label_length}
+        return {Constants.FEATURE_IDS_NAME: feature_ids,
+                Constants.FEATURE_LENGTH_NAME: feature_length,
+                Constants.LABEL_IDS_NAME: label_ids,
+                Constants.LABEL_LENGTH_NAME: label_length}
 
     @property
     def input_fields(self):
         """ Returns the dictionary of placeholders. """
-        if Dataset._input_fields is None:
-            Dataset._input_fields = Dataset._make_input_fields()
-        return Dataset._input_fields
+        if self._input_fields is None:
+            self._input_fields = Dataset._make_input_fields()
+        return self._input_fields
 
     @property
     def vocab_source(self):

@@ -23,6 +23,7 @@ from abc import ABCMeta, abstractmethod
 
 import numpy
 import six
+import random
 import tensorflow as tf
 from tensorflow import gfile
 from tensorflow.python.training import saver as saver_lib
@@ -34,10 +35,11 @@ from njunmt.inference.decode import infer
 from njunmt.models.model_builder import model_fn
 from njunmt.utils.configurable import update_infer_params
 from njunmt.utils.expert_utils import StepTimer
-from njunmt.utils.global_names import GlobalNames
-from njunmt.utils.global_names import ModeKeys
+from njunmt.utils.constants import Constants
+from njunmt.utils.constants import ModeKeys
 from njunmt.utils.metrics import multi_bleu_score
 from njunmt.utils.misc import get_dict_from_collection
+from njunmt.utils.misc import open_file
 from njunmt.utils.summary_writer import SummaryWriter
 
 
@@ -193,20 +195,25 @@ class LossMetricSpec(TextMetricSpec):
             batch_tokens_size=None,
             shuffle_every_epoch=None,
             bucketing=True)
-        self._eval_feeding_data = text_inputter.make_feeding_data()
-        estimator_spec = model_fn(model_configs=self._model_configs, mode=ModeKeys.EVAL, dataset=self._dataset,
-                                  name=self._model_name, reuse=True, verbose=False)
+        self._eval_feeding_data = text_inputter.make_feeding_data(in_memory=True)
+        estimator_spec = model_fn(
+            model_configs=self._model_configs,
+            mode=ModeKeys.EVAL,
+            dataset=self._dataset,
+            name=self._model_name,
+            reuse=True,
+            verbose=False)
         self._loss_op = estimator_spec.loss
         # for learning decay decay
         self._half_lr = False
         if self._model_configs["optimizer_params"]["optimizer.lr_decay"]["decay_type"] == "loss_decay":
             self._half_lr = True
-            lr_tensor_dict = get_dict_from_collection(GlobalNames.LEARNING_RATE_VAR_NAME)
-            self._learning_rate = lr_tensor_dict[GlobalNames.LEARNING_RATE_VAR_NAME]
+            lr_tensor_dict = get_dict_from_collection(Constants.LEARNING_RATE_VAR_NAME)
+            self._learning_rate = lr_tensor_dict[Constants.LEARNING_RATE_VAR_NAME]
             self._max_patience = self._model_configs["optimizer_params"]["optimizer.lr_decay"]["patience"]
-            div_factor = lr_tensor_dict[GlobalNames.LR_ANNEAL_DIV_FACTOR_NAME]
+            div_factor = lr_tensor_dict[Constants.LR_ANNEAL_DIV_FACTOR_NAME]
             self._half_lr_op = div_factor.assign(div_factor * 2.)
-            self._patience = 0
+            self._bad_count = 0
             self._min_loss = 10000.
 
     def _do_evaluation(self, run_context, global_step):
@@ -221,18 +228,18 @@ class LossMetricSpec(TextMetricSpec):
         """
         loss = evaluate(sess=run_context.session,
                         eval_op=self._loss_op,
-                        feeding_data=self._eval_feeding_data)
+                        eval_data=self._eval_feeding_data)
         tf.logging.info("Evaluating DEVSET: DevLoss=%f  GlobalStep=%d" % (loss, global_step))
         if self._summary_writer is not None:
             self._summary_writer.add_summary("Metrics/DevLoss", loss, global_step)
         if self._half_lr:
             if loss <= self._min_loss:
                 self._min_loss = loss
-                self._patience = 0
+                self._bad_count = 0
             else:
-                self._patience += 1
-                if self._patience >= self._max_patience:
-                    self._patience = 0
+                self._bad_count += 1
+                if self._bad_count >= self._max_patience:
+                    self._bad_count = 0
                     run_context.session.run(self._half_lr_op)
                     now_lr = run_context.session.run(self._learning_rate)
                     tf.logging.info("Hit maximum patience=%d. HALF THE LEARNING RATE TO %f at %d"
@@ -253,8 +260,6 @@ class BleuMetricSpec(TextMetricSpec):
                  length_penalty=None,
                  delimiter=" ",
                  maximum_keep_models=5,
-                 multibleu_script="./njunmt/tools/multi-bleu.perl",
-                 tokenize_script="./njunmt/tools/tokenizeChinese.py",
                  char_level=False,
                  early_stop=True,
                  estop_patience=30,
@@ -277,8 +282,6 @@ class BleuMetricSpec(TextMetricSpec):
             delimiter: The delimiter of output token sequence.
             maximum_keep_models: The maximum number of models that will have a
               backup according to the BLEU score.
-            multibleu_script: The multi-bleu script path.
-            tokenize_script: The tokenizeChinese.py script path.
             char_level: Whether to split words into characters (only for Chinese).
             early_stop: Whether to early stop the program when the model does not
               improve BLEU anymore.
@@ -296,8 +299,6 @@ class BleuMetricSpec(TextMetricSpec):
         self._length_penalty = length_penalty
         self._delimiter = delimiter
         self._char_level = char_level
-        self._tokenize_script = tokenize_script
-        self._multibleu_script = multibleu_script
         self._early_stop = early_stop
         self._estop_patience_max = estop_patience
         self._maximum_keep_models = maximum_keep_models
@@ -308,43 +309,17 @@ class BleuMetricSpec(TextMetricSpec):
     def _read_ckpt_bleulog(self):
         """Read the best BLEU scores and the name of corresponding
         checkpoint archives from log file."""
-        if gfile.Exists(GlobalNames.TOP_BLEU_CKPTLOG_FILENAME):
-            with gfile.GFile(GlobalNames.TOP_BLEU_CKPTLOG_FILENAME, "r") as fp:
+        if gfile.Exists(Constants.TOP_BLEU_CKPTLOG_FILENAME):
+            with gfile.GFile(Constants.TOP_BLEU_CKPTLOG_FILENAME, "r") as fp:
                 self._best_checkpoint_bleus = [float(x) for x in fp.readline().strip().split(",")]
                 self._best_checkpoint_names = [x for x in fp.readline().strip().split(",")]
 
     def _write_ckpt_bleulog(self):
         """Write the best BLEU scores and the name of corresponding
         checkpoint archives to log file."""
-        with gfile.GFile(GlobalNames.TOP_BLEU_CKPTLOG_FILENAME, "w") as fw:
+        with gfile.GFile(Constants.TOP_BLEU_CKPTLOG_FILENAME, "w") as fw:
             fw.write(','.join([str(x) for x in self._best_checkpoint_bleus]) + "\n")
             fw.write(','.join([x for x in self._best_checkpoint_names]) + "\n")
-
-    def _check_bleu_script(self):
-        """ Checks the correctness of the multi-bleu script.
-
-        Returns: True/False
-
-        Raises:
-            OSError: if multi-bleu script not exists, or if
-              evaluation labels file not exits, or if BLEU score
-              is not correct.
-        """
-        if not gfile.Exists(self._multibleu_script):
-            raise OSError("File not found. Fail to open multi-bleu scrip: {}"
-                          .format(self._multibleu_script))
-        if gfile.Exists(self._eval_labels_file):
-            pseudo_predictions = self._eval_labels_file
-        else:
-            pseudo_predictions = self._eval_labels_file + "0"
-            if not gfile.Exists(pseudo_predictions):
-                raise OSError("File not found. Fail to open eval_labels_file: {} or {}"
-                              .format(self._eval_labels_file, pseudo_predictions))
-        score = multi_bleu_score(self._multibleu_script, self._eval_labels_file, pseudo_predictions)
-        if int(score) < 100:
-            raise OSError("Fail to run multi-bleu scrip: {}. "
-                          "The evaluation output is {} which should be 100"
-                          .format(self._multibleu_script, score))
 
     def _prepare(self):
         """ Prepares for evaluation.
@@ -356,23 +331,30 @@ class BleuMetricSpec(TextMetricSpec):
             dataset=self._dataset,
             data_field_name="eval_features_file",
             batch_size=self._batch_size)
-        self._eval_feeding_data = text_inputter.make_feeding_data()
+        self._infer_data = text_inputter.make_feeding_data()
         self._model_configs = update_infer_params(  # update inference parameters
             self._model_configs,
             beam_size=self._beam_size,
             maximum_labels_length=self._maximum_labels_length,
             length_penalty=self._length_penalty)
-        estimator_spec = model_fn(model_configs=self._model_configs, mode=ModeKeys.INFER, dataset=self._dataset,
+        estimator_spec = model_fn(model_configs=self._model_configs,
+                                  mode=ModeKeys.INFER, dataset=self._dataset,
                                   name=self._model_name, reuse=True, verbose=False)
         self._predict_ops = estimator_spec.predictions
-        tmp_trans_dir = os.path.join(self._model_configs["model_dir"], GlobalNames.TMP_TRANS_DIRNAME)
+        tmp_trans_dir = os.path.join(self._model_configs["model_dir"], Constants.TMP_TRANS_DIRNAME)
         if not gfile.Exists(tmp_trans_dir):
             gfile.MakeDirs(tmp_trans_dir)
-        self._tmp_trans_file_prefix = os.path.join(tmp_trans_dir, GlobalNames.TMP_TRANS_FILENAME_PREFIX)
+        self._tmp_trans_file_prefix = os.path.join(tmp_trans_dir, Constants.TMP_TRANS_FILENAME_PREFIX)
         self._read_ckpt_bleulog()
-        self._eval_labels_file = self._dataset.eval_labels_file
-        self._check_bleu_script()
-        self._estop_patience = 0
+        # load references
+        self._references = []
+        for rfile in self._dataset.eval_labels_file:
+            with open_file(rfile) as fp:
+                self._references.append(fp.readlines())
+        self._references = list(map(list, zip(*self._references)))
+        with open_file(self._dataset.eval_features_file) as fp:
+            self._sources = fp.readlines()
+        self._bad_count = 0
         self._best_bleu_score = 0.
 
     def _do_evaluation(self, run_context, global_step):
@@ -384,31 +366,35 @@ class BleuMetricSpec(TextMetricSpec):
         """
         start_time = time.time()
         output_prediction_file = self._tmp_trans_file_prefix + str(global_step)
-        samples_src, samples_trg = infer(
+        sources, hypothesis = infer(
             sess=run_context.session,
             prediction_op=self._predict_ops,
-            feeding_data=self._eval_feeding_data,
+            infer_data=self._infer_data,
             output=output_prediction_file,
             vocab_target=self._dataset.vocab_target,
-            alpha=self._model_configs["model_params"]["inference.length_penalty"],
+            vocab_source=self._dataset.vocab_source,
             delimiter=self._delimiter,
             output_attention=False,
             tokenize_output=self._char_level,
-            tokenize_script=self._tokenize_script,
             verbose=False)
         # print translation samples
-        for idx, (s, p) in enumerate(zip(samples_src, samples_trg)):
-            tf.logging.info("Sample%d Source: %s" % (idx, s))
-            tf.logging.info("Sample%d Prediction: %s\n" % (idx, p))
+        random_start = random.randint(0, len(hypothesis) - 5)
+        for idx in range(5):
+            tf.logging.info("Sample%d Source: %s" % (idx, self._sources[idx + random_start].strip()))
+            tf.logging.info("Sample%d Encoded Input: %s" % (idx, sources[idx + random_start]))
+            tf.logging.info("Sample%d Reference: %s" % (idx, self._references[idx + random_start][0].strip()))
+            tf.logging.info("Sample%d Hypothesis: %s\n" % (idx, hypothesis[idx + random_start].strip()))
         # evaluate with BLEU
-        bleu = multi_bleu_score(self._multibleu_script, self._eval_labels_file, output_prediction_file)
+        bleu = multi_bleu_score(hypothesis, self._references)
         if self._summary_writer is not None:
             self._summary_writer.add_summary("Metrics/BLEU", bleu, global_step)
         _, elapsed_time_all = self._timer.update_last_triggered_step(global_step)
-        tf.logging.info("Evaluating DEVSET: BLEU=%.2f (Best %.2f)  GlobalStep=%d    UD %.2f   UDfromStart %.2f"
-                        % (bleu, self._best_bleu_score, global_step,
-                           time.time() - start_time, elapsed_time_all))
         self._update_bleu_ckpt(run_context, bleu, global_step)
+        tf.logging.info(
+            "Evaluating DEVSET: BLEU=%.2f (Best %.2f)  GlobalStep=%d  BadCount=%d  "
+            "UD %.2f  UDfromStart %.2f" % (
+                bleu, self._best_bleu_score, global_step, self._bad_count,
+                time.time() - start_time, elapsed_time_all))
 
     def _update_bleu_ckpt(self, run_context, bleu, global_step):
         """ Updates the best checkpoints according to BLEU score and
@@ -426,29 +412,28 @@ class BleuMetricSpec(TextMetricSpec):
         """
         if bleu >= self._best_bleu_score:
             self._best_bleu_score = bleu
-            self._estop_patience = 0
+            self._bad_count = 0
         else:
-            self._estop_patience += 1
-        if self._estop_patience >= self._estop_patience_max and self._early_stop:
+            self._bad_count += 1
+        if self._bad_count >= self._estop_patience_max and self._early_stop:
             tf.logging.info("early stop.")
             run_context.request_stop()
         # saving checkpoints if eval_steps and save_checkpoint_steps mismatch
         if not gfile.Exists("{}-{}.meta".format(
-                os.path.join(self._checkpoint_dir, GlobalNames.MODEL_CKPT_FILENAME), global_step)):
+                os.path.join(self._checkpoint_dir, Constants.MODEL_CKPT_FILENAME), global_step)):
             saver = saver_lib._get_saver_or_default()
             saver.save(run_context.session,
-                       os.path.join(self._checkpoint_dir, GlobalNames.MODEL_CKPT_FILENAME),
+                       os.path.join(self._checkpoint_dir, Constants.MODEL_CKPT_FILENAME),
                        global_step=global_step)
         if len(self._best_checkpoint_names) == 0 or bleu > self._best_checkpoint_bleus[0]:
-            tarname = "{}{}.tar.gz".format(GlobalNames.CKPT_TGZ_FILENAME_PREFIX, global_step)
+            tarname = "{}{}.tar.gz".format(Constants.CKPT_TGZ_FILENAME_PREFIX, global_step)
             os.system("tar -zcvf {tarname} {checkpoint} {model_config} {model_analysis} {ckptdir}/*{global_step}*"
-                .format(
-                tarname=tarname,
-                checkpoint=os.path.join(self._checkpoint_dir, "checkpoint"),
-                model_config=os.path.join(self._checkpoint_dir, GlobalNames.MODEL_CONFIG_YAML_FILENAME),
-                model_analysis=os.path.join(self._checkpoint_dir, GlobalNames.MODEL_ANALYSIS_FILENAME),
-                ckptdir=self._checkpoint_dir,
-                global_step=global_step))
+                      .format(tarname=tarname,
+                              checkpoint=os.path.join(self._checkpoint_dir, "checkpoint"),
+                              model_config=os.path.join(self._checkpoint_dir, Constants.MODEL_CONFIG_YAML_FILENAME),
+                              model_analysis=os.path.join(self._checkpoint_dir, Constants.MODEL_ANALYSIS_FILENAME),
+                              ckptdir=self._checkpoint_dir,
+                              global_step=global_step))
             self._best_checkpoint_bleus.append(bleu)
             self._best_checkpoint_names.append(tarname)
             if len(self._best_checkpoint_bleus) > self._maximum_keep_models:

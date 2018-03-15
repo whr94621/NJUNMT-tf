@@ -17,9 +17,6 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy
-import os
-import random
-import string
 import re
 import tensorflow as tf
 from tensorflow import gfile
@@ -27,8 +24,9 @@ from tensorflow import gfile
 from njunmt.inference.attention import process_attention_output
 from njunmt.inference.attention import pack_batch_attention_dict
 from njunmt.inference.attention import dump_attentions
-from njunmt.utils.global_names import GlobalNames
+from njunmt.utils.constants import Constants
 from njunmt.utils.misc import padding_batch_data
+from njunmt.tools.tokenizeChinese import to_chinese_char
 
 
 def _evaluate(
@@ -79,35 +77,35 @@ def evaluate_sentences(
         re.split(r"\s*", snt.strip()), n_words_src) for snt in sources]
     targets = [vocab_target.convert_to_idlist(
         re.split(r"\s*", snt.strip()), n_words_trg) for snt in targets]
-    ph_x = input_fields[GlobalNames.PH_FEATURE_IDS_NAME]
-    ph_x_len = input_fields[GlobalNames.PH_FEATURE_LENGTH_NAME]
-    ph_y = input_fields[GlobalNames.PH_LABEL_IDS_NAME]
-    ph_y_len = input_fields[GlobalNames.PH_LABEL_LENGTH_NAME]
-    x, len_x = padding_batch_data(sources, vocab_source.eos_id)
-    y, len_y = padding_batch_data(targets, vocab_target.eos_id)
+    ph_x = input_fields[Constants.FEATURE_IDS_NAME]
+    ph_x_len = input_fields[Constants.FEATURE_LENGTH_NAME]
+    ph_y = input_fields[Constants.LABEL_IDS_NAME]
+    ph_y_len = input_fields[Constants.LABEL_LENGTH_NAME]
+    x, len_x = padding_batch_data(sources, vocab_source.pad_id)
+    y, len_y = padding_batch_data(targets, vocab_target.pad_id)
     feed_dict = {ph_x: x, ph_x_len: len_x,
                  ph_y: y, ph_y_len: len_y}
     return _evaluate(sess, feed_dict, eval_op)
 
 
-def evaluate(sess, eval_op, feeding_data):
+def evaluate(sess, eval_op, eval_data):
     """ Evaluates data by loss.
 
     Args:
-        attention_op:
         sess: `tf.Session`.
         eval_op: Tensorflow operation, computing the loss.
-        feeding_data: An iterable instance that each element
+        eval_data: An iterable instance that each element
           is a packed feeding dictionary for `sess`.
 
     Returns: Total loss averaged by number of data samples.
     """
     losses = 0.
     total_size = 0
-    for num_data, feed_dict in feeding_data:
-        loss = _evaluate(sess, feed_dict, eval_op)
-        losses += loss * float(num_data)
-        total_size += num_data
+    for data in eval_data:
+        n_samples = len(data["feature_ids"])
+        loss = _evaluate(sess, data["feed_dict"], eval_op)
+        losses += loss * float(n_samples)
+        total_size += n_samples
     loss = losses / float(total_size)
     return loss
 
@@ -115,9 +113,9 @@ def evaluate(sess, eval_op, feeding_data):
 def evaluate_with_attention(
         sess,
         eval_op,
-        feeding_data,
-        vocab_source=None,
-        vocab_target=None,
+        eval_data,
+        vocab_source,
+        vocab_target,
         attention_op=None,
         output_filename_prefix=None):
     """ Evaluates data by loss.
@@ -125,10 +123,10 @@ def evaluate_with_attention(
     Args:
         sess: `tf.Session`.
         eval_op: Tensorflow operation, computing the loss.
-        feeding_data: An iterable instance that each element
+        eval_data: An iterable instance that each element
           is a packed feeding dictionary for `sess`.
-        vocab_source: A `Vocab` instance for source side feature map. For highlighting UNK.
-        vocab_target: A `Vocab` instance for target side feature map. For highlighting UNK.
+        vocab_source: A `Vocab` instance for source side feature map.
+        vocab_target: A `Vocab` instance for target side feature map.
         attention_op: Tensorflow operation for output attention.
         output_filename_prefix: A string.
 
@@ -137,14 +135,16 @@ def evaluate_with_attention(
     losses = 0.
     total_size = 0
     attentions = {}
-    for ss_strs, tt_strs, feed_dict in feeding_data:
+    for data in eval_data:
         if attention_op is None:
-            loss = _evaluate(sess, feed_dict, eval_op)
+            loss = _evaluate(sess, data["feed_dict"], eval_op)
         else:
-            loss, atts = _evaluate(sess, feed_dict, [eval_op, attention_op])
-            if vocab_source is not None:
-                ss_strs = [vocab_source.decorate_with_unk(ss) for ss in ss_strs]
-                tt_strs = [vocab_target.decorate_with_unk(tt) for tt in tt_strs]
+            loss, atts = _evaluate(sess, data["feed_dict"], [eval_op, attention_op])
+            ss_strs = [vocab_source.convert_to_wordlist(ss, bpe_decoding=False)
+                       for ss in data["feature_ids"]]
+            tt_strs = [vocab_target.convert_to_wordlist(
+                tt, bpe_decoding=False, reverse_seq=False)
+                       for tt in data["label_ids"]]
             attentions.update(pack_batch_attention_dict(
                 total_size, ss_strs, tt_strs, atts))
         losses += loss * float(len(ss_strs))
@@ -160,7 +160,6 @@ def _infer(
         feed_dict,
         prediction_op,
         batch_size,
-        alpha=None,
         top_k=1,
         output_attention=False):
     """ Infers a batch of samples with beam search.
@@ -169,10 +168,7 @@ def _infer(
         sess: `tf.Session`
         feed_dict: A dictionary of feeding data.
         prediction_op: Tensorflow operation for inference.
-        batch_size: An integer, the number of data samples.
-        alpha: A scalar number, length penalty rate. If not provided
-          or < 0, simply average each beam by length of predicted
-          sequence.
+        batch_size: The batch size.
         top_k: An integer, number of predicted sequences will be
           returned.
         output_attention: Whether to output attention.
@@ -183,46 +179,24 @@ def _infer(
       The `attention_scores` is None if there is no attention
       related information in `prediction_op`.
     """
+    brief_pred_op = dict()
+    brief_pred_op["hypothesis"] = prediction_op["sorted_hypothesis"]
     if output_attention:
-        predict_out = sess.run(prediction_op,
-                               feed_dict=feed_dict)
-    else:
-        has_att = False
-        if "attentions" in prediction_op:
-            att_op = prediction_op.pop("attentions")
-            has_att = True
-        predict_out = sess.run(prediction_op,
-                               feed_dict=feed_dict)
-        if has_att:
-            prediction_op["attentions"] = att_op
-    predicted_ids = predict_out["predicted_ids"]  # [n_timesteps_trg, batch_size * beam_size]
-    beam_ids = predict_out["beam_ids"]  # [n_timesteps_trg, batch_size * beam_size]
-    sequence_lengths = predict_out["sequence_lengths"]  # [n_timesteps_trg, batch_size * beam_size]
-    log_probs = predict_out["log_probs"]  # [n_timesteps_trg, batch_size * beam_size]
+        brief_pred_op["sorted_argidx"] = prediction_op["sorted_argidx"]
+        brief_pred_op["attentions"] = prediction_op["attentions"]
+        brief_pred_op["beam_ids"] = prediction_op["beam_ids"]
 
-    gathered_pred_ids = numpy.zeros_like(beam_ids)  # [n_timesteps_trg, batch_size * beam_size]
-    for idx in range(beam_ids.shape[0]):
-        gathered_pred_ids = gathered_pred_ids[:, beam_ids[idx]]
-        gathered_pred_ids[idx, :] = predicted_ids[idx]
-    gathered_pred_ids = gathered_pred_ids.transpose()  # [batch_size * beam_size, n_timesteps_trg]
-
-    lengths = numpy.array(sequence_lengths[-1], dtype=numpy.float32)
-    if alpha is None or alpha < 0.:
-        penalty = lengths
-    else:
-        penalty = ((5.0 + lengths) / 6.0) ** alpha
-
-    scores = log_probs[-1] / penalty
-    beam_size = scores.shape[0] // batch_size
-    scores = scores.reshape([-1, beam_size])  # [batch_size, beam_size]
-
-    argidx = numpy.argsort(scores, axis=1)[:, ::-1]  # descending order: [batch_size, beam_size]
-    argidx += numpy.tile(numpy.arange(batch_size) * beam_size, [beam_size, 1]).transpose()
-    argidx = numpy.reshape(argidx[:, :top_k], -1)
+    predict_out = sess.run(brief_pred_op, feed_dict=feed_dict)
+    num_samples = predict_out["hypothesis"].shape[0]
+    beam_size = num_samples // batch_size
+    # [batch_, beam_]
+    batch_beam_pos = numpy.tile(numpy.arange(batch_size) * beam_size, [beam_size, 1]).transpose()
+    batch_beam_pos = numpy.reshape(batch_beam_pos[:, :top_k], -1)
     if output_attention:
+        argidx = predict_out.pop("sorted_argidx")[batch_beam_pos]
         attentions = process_attention_output(predict_out, argidx)
-        return gathered_pred_ids[argidx, :], attentions
-    return gathered_pred_ids[argidx, :], None
+        return predict_out["hypothesis"][batch_beam_pos, :], attentions
+    return predict_out["hypothesis"][batch_beam_pos, :], None
 
 
 def infer_sentences(
@@ -231,7 +205,6 @@ def infer_sentences(
         input_fields,
         prediction_op,
         vocab_source,
-        alpha=None,
         top_k=1,
         n_words_src=-1):
     """ Infers a list of sentences.
@@ -258,36 +231,34 @@ def infer_sentences(
     """
     sources = [vocab_source.convert_to_idlist(
         re.split(r"\s*", snt.strip()), n_words_src) for snt in sources]
-    ph_x = input_fields[GlobalNames.PH_FEATURE_IDS_NAME]
-    ph_x_len = input_fields[GlobalNames.PH_FEATURE_LENGTH_NAME]
-    x, len_x = padding_batch_data(sources, vocab_source.eos_id)
+    ph_x = input_fields[Constants.FEATURE_IDS_NAME]
+    ph_x_len = input_fields[Constants.FEATURE_LENGTH_NAME]
+    x, len_x = padding_batch_data(sources, vocab_source.pad_id)
     feed_dict = {ph_x: x, ph_x_len: len_x}
-    return _infer(sess, feed_dict, prediction_op, len(sources), alpha, top_k)
+    return _infer(sess, feed_dict, prediction_op, len(x), top_k)
 
 
 def infer(
         sess,
         prediction_op,
-        feeding_data,
+        infer_data,
         output,
+        vocab_source,
         vocab_target,
-        vocab_source=None,
-        alpha=None,
         delimiter=" ",
         output_attention=False,
         tokenize_output=False,
-        tokenize_script="./njunmt/tools/tokenizeChinese.py",
         verbose=True):
     """ Infers data and save the prediction results.
 
     Args:
         sess: `tf.Session`.
         prediction_op: Tensorflow operation for inference.
-        feeding_data: An iterable instance that each element
+        infer_data: An iterable instance that each element
           is a packed feeding dictionary for `sess`.
         output: Output file name, `str`.
+        vocab_source: A `Vocab` instance for source side feature map.
         vocab_target: A `Vocab` instance for target side feature map.
-        vocab_source: A `Vocab` instance for source side feature map. For highlighting UNK.
         alpha: A scalar number, length penalty rate. If not provided
           or < 0, simply average each beam by length of predicted
           sequence.
@@ -295,53 +266,40 @@ def infer(
         output_attention: Whether to output attention information.
         tokenize_output: Whether to split words into characters
           (only for Chinese).
-        tokenize_script: The script for `tokenize_output`.
         verbose: Print inference information if set True.
 
-    Returns: A tuple `(sample_src, sample_trg)`, two lists of
-      strings. Sample from `feeding_data`.
+    Returns: A tuple `(sources, hypothesis)`, two lists of
+      strings.
     """
     attentions = dict()
-    samples_src = []
-    samples_trg = []
-    with gfile.GFile(output, "w") as fw:
-        cnt = 0
-        for x_str, x_len, feeding_batch in feeding_data:
-            prediction, att = _infer(sess, feeding_batch, prediction_op,
-                                     len(x_str), alpha=alpha, top_k=1,
-                                     output_attention=output_attention)
-            y_str = [delimiter.join(vocab_target.convert_to_wordlist(prediction[sample_idx]))
-                     for sample_idx in range(prediction.shape[0])]
-            fw.write('\n'.join(y_str) + "\n")
-            # random sample
-            if random.random() < 0.3 and len(samples_src) < 5:
-                for sample_idx in range(len(x_str)):
-                    samples_src.append(x_str[sample_idx])
-                    samples_trg.append(y_str[sample_idx])
-                    if len(samples_src) >= 5:
-                        break
+    hypothesis = []
+    sources = []
+    cnt = 0
+    for data in infer_data:
+        source_tokens = [vocab_source.convert_to_wordlist(x, bpe_decoding=False)
+                         for x in data["feature_ids"]]
+        x_str = [delimiter.join(x) for x in source_tokens]
+        prediction, att = _infer(sess, data["feed_dict"], prediction_op,
+                                 len(x_str), top_k=1, output_attention=output_attention)
 
-            # output attention
-            if output_attention and att is not None:
-                source_tokens = [x.strip().split() for x in x_str]
-                if vocab_source is not None:
-                    source_tokens = [vocab_source.decorate_with_unk(x)
-                                     for x in source_tokens]
-                candidate_tokens = [vocab_target.convert_to_wordlist(
-                    prediction[idx, :], bpe_decoding=False, reverse_seq=False)
-                                    for idx in range(len(x_str))]
+        sources.extend(x_str)
+        hypothesis.extend([delimiter.join(vocab_target.convert_to_wordlist(prediction[sample_idx]))
+                           for sample_idx in range(prediction.shape[0])])
+        if output_attention and att is not None:
+            candidate_tokens = [vocab_target.convert_to_wordlist(
+                prediction[idx, :], bpe_decoding=False, reverse_seq=False)
+                                for idx in range(len(x_str))]
 
-                attentions.update(pack_batch_attention_dict(
-                    cnt, source_tokens, candidate_tokens, att))
-            cnt += len(x_str)
-            if verbose:
-                tf.logging.info(cnt)
+            attentions.update(pack_batch_attention_dict(
+                cnt, source_tokens, candidate_tokens, att))
+        cnt += len(x_str)
+        if verbose:
+            tf.logging.info(cnt)
     if tokenize_output:
-        tmp_output_file = output + ''.join((''.join(
-            random.sample(string.digits + string.ascii_letters, 10))).split())
-        os.system("python %s %s %s" %
-                  (tokenize_script, output, tmp_output_file))
-        os.system("mv %s %s" % (tmp_output_file, output))
+        hypothesis = to_chinese_char(hypothesis)
+    if output:
+        with gfile.GFile(output, "w") as fw:
+            fw.write("\n".join(hypothesis) + "\n")
     if output_attention:
         dump_attentions(output, attentions)
-    return samples_src, samples_trg
+    return sources, hypothesis

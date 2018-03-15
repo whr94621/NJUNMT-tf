@@ -30,8 +30,7 @@ from njunmt.utils.configurable import parse_params
 from njunmt.utils.configurable import print_params
 from njunmt.utils.configurable import update_eval_metric
 from njunmt.utils.configurable import update_infer_params
-from njunmt.utils.metrics import multi_bleu_score
-from njunmt.utils.misc import optimistic_restore
+from njunmt.utils.metrics import multi_bleu_score_from_file
 
 
 @six.add_metaclass(ABCMeta)
@@ -154,18 +153,18 @@ class TrainingExperiment(Experiment):
             self._model_configs["train"]["batch_tokens_size"],
             self._model_configs["train"]["shuffle_every_epoch"])
         train_data = train_text_inputter.make_feeding_data(
-            maximum_encoded_features_length=self._model_configs["train"]["maximum_features_length"],
-            maximum_encoded_labels_length=self._model_configs["train"]["maximum_labels_length"])
+            maximum_features_length=self._model_configs["train"]["maximum_features_length"],
+            maximum_labels_length=self._model_configs["train"]["maximum_labels_length"])
         eidx = 0
         while True:
             if sess.should_stop():
                 break
             tf.logging.info("STARTUP Epoch {}".format(eidx))
 
-            for _, data_feeding in train_data:
+            for data in train_data:
                 if sess.should_stop():
                     break
-                sess.run(train_op, feed_dict=data_feeding)
+                sess.run(train_op, feed_dict=data["feed_dict"])
             eidx += 1
 
 
@@ -206,9 +205,7 @@ class InferExperiment(Experiment):
             "length_penalty": -1.0,
             "maximum_labels_length": 150,
             "delimiter": " ",
-            "char_level": False,
-            "tokenize_script": "./njunmt/tools/tokenizeChinese.py",
-            "multibleu_script": "./njunmt/tools/multi-bleu.perl"}
+            "char_level": False}
 
     @staticmethod
     def default_inferdata_params():
@@ -259,7 +256,8 @@ class InferExperiment(Experiment):
         checkpoint_path = tf.train.latest_checkpoint(self._model_configs["model_dir"])
         if checkpoint_path:
             tf.logging.info("reloading models...")
-            optimistic_restore(sess, checkpoint_path)
+            saver = tf.train.Saver()
+            saver.restore(sess, checkpoint_path)
         else:
             raise OSError("File NOT Found. Fail to find checkpoint file from: {}"
                           .format(self._model_configs["model_dir"]))
@@ -267,30 +265,28 @@ class InferExperiment(Experiment):
         tf.logging.info("Start inference.")
         overall_start_time = time.time()
 
-        for feeding_data, param in zip(text_inputter.make_feeding_data(),
+        for infer_data, param in zip(text_inputter.make_feeding_data(),
                                        self._model_configs["infer_data"]):
             tf.logging.info("Infer Source File: {}.".format(param["features_file"]))
             start_time = time.time()
             infer(sess=sess,
                   prediction_op=predict_op,
-                  feeding_data=feeding_data,
+                  infer_data=infer_data,
                   output=param["output_file"],
-                  vocab_target=self._vocab_target,
                   vocab_source=self._vocab_source,
-                  alpha=self._model_configs["infer"]["length_penalty"],
+                  vocab_target=self._vocab_target,
                   delimiter=self._model_configs["infer"]["delimiter"],
                   output_attention=param["output_attention"],
                   tokenize_output=self._model_configs["infer"]["char_level"],
-                  tokenize_script=self._model_configs["infer"]["tokenize_script"],
                   verbose=True)
             tf.logging.info("FINISHED {}. Elapsed Time: {}."
                             .format(param["features_file"], str(time.time() - start_time)))
             if param["labels_file"] is not None:
-                bleu_score = multi_bleu_score(
-                    self._model_configs["infer"]["multibleu_script"],
-                    param["labels_file"], param["output_file"])
-                tf.logging.info("BLEU score ({}): {}"
-                                .format(param["features_file"], bleu_score))
+                bleu_score = multi_bleu_score_from_file(
+                    hypothesis_file=param["output_file"],
+                    references_files=param["labels_file"])
+                tf.logging.info("BLEU score (%s): %.2f"
+                                % (param["features_file"], bleu_score))
         tf.logging.info("Total Elapsed Time: %s" % str(time.time() - overall_start_time))
 
 
@@ -380,7 +376,8 @@ class EvalExperiment(Experiment):
         checkpoint_path = tf.train.latest_checkpoint(self._model_configs["model_dir"])
         if checkpoint_path:
             tf.logging.info("reloading models...")
-            optimistic_restore(sess, checkpoint_path)
+            saver = tf.train.Saver()
+            saver.restore(sess, checkpoint_path)
         else:
             raise OSError("File NOT Found. Fail to load checkpoint file from: {}"
                           .format(self._model_configs["model_dir"]))
@@ -388,7 +385,7 @@ class EvalExperiment(Experiment):
         tf.logging.info("Start evaluation.")
         overall_start_time = time.time()
 
-        for feeding_data, param in zip(text_inputter.make_eval_feeding_data(),
+        for eval_data, param in zip(text_inputter.make_feeding_data(in_memory=True),
                                        self._model_configs["eval_data"]):
             tf.logging.info("Evaluation Source File: {}.".format(param["features_file"]))
             tf.logging.info("Evaluation Target File: {}.".format(param["labels_file"]))
@@ -396,7 +393,7 @@ class EvalExperiment(Experiment):
             result = evaluate_with_attention(
                 sess=sess,
                 eval_op=estimator_spec.loss,
-                feeding_data=feeding_data,
+                eval_data=eval_data,
                 vocab_source=self._vocab_source,
                 vocab_target=self._vocab_target,
                 attention_op=estimator_spec.predictions \

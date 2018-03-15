@@ -20,7 +20,7 @@ import tensorflow as tf
 from tensorflow.python.util import nest
 from collections import namedtuple
 
-from njunmt.utils.global_names import ModeKeys
+from njunmt.utils.constants import ModeKeys
 from njunmt.decoders.decoder import dynamic_decode
 from njunmt.decoders.decoder import initialize_cache
 from njunmt.decoders.decoder import Decoder
@@ -119,7 +119,7 @@ class TransformerDecoder(Decoder):
         return decoder_output.decoder_hidden
 
     def decode(self, encoder_output, bridge, helper,
-               target_modality):
+               target_modality, **kwargs):
         """ Decodes one sample.
 
         Args:
@@ -135,9 +135,8 @@ class TransformerDecoder(Decoder):
         Returns: A tuple `(decoder_output, decoder_status)`. The
           `decoder_output` is an instance of `collections.namedtuple`
           whose element types are defined by `output_dtype` property.
-          For mode=INFER, the `decoder_status` is an instance of
-          `collections.namedtuple` whose element types are defined by
-          `BeamSearchStateSpec`, indicating the status of beam search.
+          For mode=INFER, the `decoder_status` is a dict containing
+          hypothesis, log probabilities, beam ids and decoding length.
           For mode=TRAIN/EVAL, the `decoder_status` is a `tf.Tensor`
           indicating logits (computed by `target_modality`), of shape
           [timesteps, batch_size, vocab_size].
@@ -182,7 +181,8 @@ class TransformerDecoder(Decoder):
         outputs, infer_status = dynamic_decode(
             decoder=self, encoder_output=encoder_output,
             bridge=None, helper=helper,
-            target_modality=target_modality)
+            target_modality=target_modality,
+            **kwargs)
         return outputs, infer_status
 
     def prepare(self, encoder_output, bridge, helper):
