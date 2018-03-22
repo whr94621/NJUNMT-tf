@@ -5,7 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-...
+- WMT2017 EN<->DE benchmark.
+- Load pretrained model.
 
 ### Changed
 - Default loss function.
